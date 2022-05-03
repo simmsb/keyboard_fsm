@@ -1,6 +1,8 @@
 #![cfg_attr(test, feature(assert_matches))]
 #![allow(unused)]
 
+use std::ops::RangeInclusive;
+
 use embedded_time::duration::Milliseconds;
 use embedded_time::Instant;
 
@@ -23,6 +25,8 @@ type KeyCode = u8;
 enum KeyEvent {
     Press(KeyCode),
     Depress(KeyCode),
+    PressCurrent,
+    DepressCurrent,
 }
 
 enum InternalEvent {
@@ -40,20 +44,38 @@ impl InternalEvent {
 }
 
 enum TransitionCondition {
-    Pressed(u8),
-    Depressed(u8),
-    // TODO: anybut pressed, anybut depressed
+    StateSet(StateFlags),
+    StateNotSet(StateFlags),
+    Pressed(RangeInclusive<u8>),
+    Depressed(RangeInclusive<u8>),
     ElapsedLess(Milliseconds),
     ElapsedGreater(Milliseconds),
 }
 
 impl TransitionCondition {
-    fn evaluate(&self, elapsed: Milliseconds, key: Option<InputEvent>) -> bool {
-        match self {
-            TransitionCondition::Pressed(x) => Some(InputEvent::Press(*x)) == key,
-            TransitionCondition::Depressed(x) => Some(InputEvent::Depress(*x)) == key,
-            TransitionCondition::ElapsedLess(x) => &elapsed < x,
-            TransitionCondition::ElapsedGreater(x) => &elapsed >= x,
+    const fn pressed_single(key: u8) -> Self {
+        Self::Pressed(key..=key)
+    }
+
+    const fn depressed_single(key: u8) -> Self {
+        Self::Depressed(key..=key)
+    }
+
+    fn evaluate(&self, elapsed: Milliseconds, key: Option<InputEvent>, state: StateFlags) -> bool {
+        match (self, key) {
+            (TransitionCondition::StateSet(mask), _) => state.contains(*mask),
+            (TransitionCondition::StateNotSet(mask), _) => !state.contains(*mask),
+            (TransitionCondition::Pressed(x), Some(InputEvent::Press(key))) => x.contains(&key),
+            (TransitionCondition::Depressed(x), Some(InputEvent::Depress(key))) => x.contains(&key),
+            (TransitionCondition::ElapsedLess(x), _) => {
+                eprintln!("{} < {}", elapsed, x);
+                &elapsed < x
+            }
+            (TransitionCondition::ElapsedGreater(x), _) => {
+                eprintln!("{} >= {}", elapsed, x);
+                &elapsed >= x
+            }
+            _ => false,
         }
     }
 }
@@ -79,7 +101,7 @@ where
             .current_state
             .transitions()
             .iter()
-            .flat_map(|t| t.evaluate(elapsed, None))
+            .flat_map(|t| t.evaluate(elapsed, None, self.flags))
             .next()
         {
             self.do_transition(internal_events, next_state, current_time);
@@ -101,7 +123,7 @@ where
             .current_state
             .transitions()
             .iter()
-            .flat_map(|t| t.evaluate(elapsed, Some(event)))
+            .flat_map(|t| t.evaluate(elapsed, Some(event), self.flags))
             .next()
         {
             self.do_transition(internal_events, next_state, current_time);
@@ -158,8 +180,13 @@ trait DynTransition: Send + Sync + 'static {
         &self,
         elapsed: Milliseconds,
         key: Option<InputEvent>,
+        state: StateFlags,
     ) -> Option<(&[KeyEvent], &[InternalEvent], &'static dyn DynState)> {
-        if self.conditions().iter().all(|c| c.evaluate(elapsed, key)) {
+        if self
+            .conditions()
+            .iter()
+            .all(|c| c.evaluate(elapsed, key, state))
+        {
             Some((
                 self.key_event_emissions(),
                 self.internal_event_emissions(),
@@ -234,21 +261,21 @@ impl std::fmt::Debug for &dyn DynState {
 
 #[cfg(test)]
 mod tests {
-    static NOW: AtomicU32 = AtomicU32::new(0);
+    struct TickerClock(u32);
 
-    fn tick() {
-        NOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    impl TickerClock {
+        fn tick(&mut self) {
+            self.0 += 1;
+        }
+
+        fn tick_n(&mut self, n: u32) {
+            self.0 += n;
+        }
+
+        fn now(&self) -> Instant<TickerClock> {
+            self.try_now().unwrap()
+        }
     }
-
-    fn tick_n(n: u32) {
-        NOW.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn now() -> Instant<TickerClock> {
-        TickerClock.try_now().unwrap()
-    }
-
-    struct TickerClock;
 
     impl embedded_time::Clock for TickerClock {
         type T = u32;
@@ -256,8 +283,7 @@ mod tests {
             embedded_time::rate::Fraction::new(1, 1_000);
 
         fn try_now(&self) -> Result<embedded_time::Instant<Self>, embedded_time::clock::Error> {
-            let now = NOW.load(std::sync::atomic::Ordering::Relaxed);
-            Ok(embedded_time::Instant::new(now))
+            Ok(embedded_time::Instant::new(self.0))
         }
     }
 
@@ -281,7 +307,7 @@ mod tests {
         };
 
         static A_0: Transition<1, 1, 0> = Transition {
-            conditions: [TransitionCondition::Pressed(0)],
+            conditions: [TransitionCondition::pressed_single(0)],
             key_event_emissions: [KeyEvent::Press(0)],
             internal_event_emissions: [],
             target: B.as_dyn(),
@@ -293,13 +319,14 @@ mod tests {
         };
 
         static B_0: Transition<1, 1, 0> = Transition {
-            conditions: [TransitionCondition::Depressed(0)],
+            conditions: [TransitionCondition::depressed_single(0)],
             key_event_emissions: [KeyEvent::Depress(0)],
             internal_event_emissions: [],
             target: A.as_dyn(),
         };
 
-        let now = now();
+        let clock = TickerClock(0);
+        let now = clock.now();
 
         let mut state = GlobalState {
             flags: StateFlags::empty(),
@@ -317,6 +344,186 @@ mod tests {
     }
 
     #[test]
+    fn mod_tap_better() {
+        static ROOT: State<3> = State {
+            name: "ROOT",
+            transitions: [ROOT_0.as_dyn(), ROOT_PRESS_1.as_dyn(), ROOT_RESET.as_dyn()],
+        };
+
+        static ROOT_0: Transition<1, 0, 0> = Transition {
+            conditions: [TransitionCondition::pressed_single(0)],
+            key_event_emissions: [],
+            internal_event_emissions: [],
+            target: MOD.as_dyn(),
+        };
+
+        static ROOT_PRESS_1: Transition<1, 1, 0> = Transition {
+            conditions: [TransitionCondition::pressed_single(1)],
+            key_event_emissions: [KeyEvent::Press(1)],
+            internal_event_emissions: [],
+            target: PRESS_1.as_dyn(),
+        };
+
+        // we'll probably have it so that if a normal key is currently being pressed, you can't enter a mod-tap, instead it will
+        // press the tap key of the mod tap
+        static PRESS_1: State<1> = State {
+            name: "PRESS_1",
+            transitions: [PRESS_1_DEPRESS.as_dyn()], //, PRESS_1_OTHER.as_dyn()]
+        };
+
+        // static PRESS_1_OTHER: Transition<1, 1, 0> = Transition {
+        //     conditions: [
+        //         TransitionCondition::pressed_single(3),
+        //     ],
+        //     key_event_emissions: [KeyEvent::Depress(1), KeyEvent::Press(3)],
+        //     internal_event_emissions: [],
+        //     target: ROOT.as_dyn(),
+        // };
+
+        static PRESS_1_DEPRESS: Transition<1, 1, 0> = Transition {
+            conditions: [TransitionCondition::depressed_single(1)],
+            key_event_emissions: [KeyEvent::Depress(1)],
+            internal_event_emissions: [],
+            target: ROOT.as_dyn(),
+        };
+
+        static ROOT_RESET: Transition<2, 1, 1> = Transition {
+            conditions: [
+                TransitionCondition::StateSet(StateFlags::SHFT),
+                TransitionCondition::depressed_single(0),
+            ],
+            key_event_emissions: [KeyEvent::Depress(2)],
+            internal_event_emissions: [InternalEvent::UnsetGlobalState(StateFlags::SHFT)],
+            target: ROOT.as_dyn(),
+        };
+
+        static MOD: State<3> = State {
+            name: "MOD",
+            transitions: [
+                MOD_TAP_TRANS.as_dyn(),
+                MOD_TAP_OTHER_TRANS.as_dyn(),
+                MOD_HOLD_TRANS.as_dyn(),
+            ],
+        };
+
+        static MOD_TAP_TRANS: Transition<2, 2, 0> = Transition {
+            conditions: [
+                TransitionCondition::depressed_single(0),
+                TransitionCondition::ElapsedLess(Milliseconds(5_u32)),
+            ],
+            key_event_emissions: [KeyEvent::Press(0), KeyEvent::Depress(0)],
+            internal_event_emissions: [],
+            target: ROOT.as_dyn(),
+        };
+
+        static MOD_TAP_OTHER_TRANS: Transition<1, 2, 1> = Transition {
+            conditions: [TransitionCondition::pressed_single(1)],
+            key_event_emissions: [KeyEvent::Press(2), KeyEvent::Press(1)],
+            internal_event_emissions: [InternalEvent::SetGlobalState(StateFlags::SHFT)],
+            target: PRESS_1.as_dyn(),
+        };
+
+        static MOD_HOLD_TRANS: Transition<1, 1, 1> = Transition {
+            conditions: [TransitionCondition::ElapsedGreater(Milliseconds(5_u32))],
+            key_event_emissions: [KeyEvent::Press(2)],
+            internal_event_emissions: [InternalEvent::SetGlobalState(StateFlags::SHFT)],
+            target: ROOT.as_dyn(),
+        };
+
+        let mut clock = TickerClock(0);
+
+        let mut state = GlobalState {
+            flags: StateFlags::empty(),
+            entered_state: clock.now(),
+            current_state: ROOT.as_dyn(),
+        };
+
+        for _ in 0..10 {
+            assert_eq!(state.flags, StateFlags::empty());
+            assert_eq!(state.current_state, ROOT.as_dyn());
+
+            let s = state.push(clock.now(), crate::InputEvent::Press(0));
+            assert_eq!(state.current_state, MOD.as_dyn());
+            assert_matches!(s, []);
+
+            clock.tick();
+
+            let s = state.push(clock.now(), crate::InputEvent::Depress(0));
+            assert_eq!(state.current_state, ROOT.as_dyn());
+            assert_eq!(state.flags, StateFlags::empty());
+            assert_matches!(s, [KeyEvent::Press(0), KeyEvent::Depress(0)]);
+
+            clock.tick();
+
+            let s = state.push(clock.now(), crate::InputEvent::Press(0));
+            assert_eq!(state.current_state, MOD.as_dyn());
+            assert_matches!(s, []);
+
+            clock.tick_n(8);
+
+            let s = state.tick(clock.now());
+            assert_eq!(state.current_state, ROOT.as_dyn());
+            assert_matches!(s, [KeyEvent::Press(2)]);
+
+            clock.tick();
+
+            let s = state.push(clock.now(), crate::InputEvent::Press(1));
+            assert_eq!(state.current_state, PRESS_1.as_dyn());
+            assert_matches!(s, [KeyEvent::Press(1)]);
+
+            clock.tick();
+            let s = state.push(clock.now(), crate::InputEvent::Depress(1));
+            assert_eq!(state.current_state, ROOT.as_dyn());
+            assert_matches!(s, [KeyEvent::Depress(1)]);
+
+            clock.tick();
+
+            let s = state.push(clock.now(), crate::InputEvent::Depress(0));
+            assert_eq!(state.current_state, ROOT.as_dyn());
+            assert_matches!(s, [KeyEvent::Depress(2)]);
+            assert_eq!(state.flags, StateFlags::empty());
+
+            clock.tick();
+
+            let s = state.push(clock.now(), crate::InputEvent::Press(0));
+            assert_eq!(state.current_state, MOD.as_dyn());
+            assert_matches!(s, []);
+
+            clock.tick();
+
+            let s = state.push(clock.now(), crate::InputEvent::Press(1));
+            assert_eq!(state.current_state, PRESS_1.as_dyn());
+            assert_matches!(s, [KeyEvent::Press(2), KeyEvent::Press(1)]);
+
+            clock.tick();
+            let s = state.push(clock.now(), crate::InputEvent::Depress(1));
+            assert_eq!(state.current_state, ROOT.as_dyn());
+            assert_matches!(s, [KeyEvent::Depress(1)]);
+
+            clock.tick();
+
+            let s = state.push(clock.now(), crate::InputEvent::Press(1));
+            assert_eq!(state.current_state, PRESS_1.as_dyn());
+            assert_matches!(s, [KeyEvent::Press(1)]);
+
+            clock.tick();
+
+            let s = state.push(clock.now(), crate::InputEvent::Depress(1));
+            assert_eq!(state.current_state, ROOT.as_dyn());
+            assert_matches!(s, [KeyEvent::Depress(1)]);
+
+            clock.tick();
+
+            let s = state.push(clock.now(), crate::InputEvent::Depress(0));
+            assert_eq!(state.current_state, ROOT.as_dyn());
+            assert_matches!(s, [KeyEvent::Depress(2)]);
+            assert_eq!(state.flags, StateFlags::empty());
+
+            clock.tick()
+        }
+    }
+
+    #[test]
     fn mod_tap() {
         static ROOT: State<1> = State {
             name: "ROOT",
@@ -324,7 +531,7 @@ mod tests {
         };
 
         static ROOT_0: Transition<1, 0, 0> = Transition {
-            conditions: [TransitionCondition::Pressed(0)],
+            conditions: [TransitionCondition::pressed_single(0)],
             key_event_emissions: [],
             internal_event_emissions: [],
             target: MOD.as_dyn(),
@@ -341,7 +548,7 @@ mod tests {
 
         static MOD_TAP_TRANS: Transition<2, 2, 0> = Transition {
             conditions: [
-                TransitionCondition::Depressed(0),
+                TransitionCondition::depressed_single(0),
                 TransitionCondition::ElapsedLess(Milliseconds(5_u32)),
             ],
             key_event_emissions: [KeyEvent::Press(0), KeyEvent::Depress(0)],
@@ -350,7 +557,7 @@ mod tests {
         };
 
         static MOD_TAP_OTHER_TRANS: Transition<1, 3, 1> = Transition {
-            conditions: [TransitionCondition::Pressed(1)],
+            conditions: [TransitionCondition::pressed_single(1)],
             key_event_emissions: [KeyEvent::Press(2), KeyEvent::Press(1), KeyEvent::Depress(1)],
             internal_event_emissions: [InternalEvent::SetGlobalState(StateFlags::SHFT)],
             target: MOD_HOLD.as_dyn(),
@@ -372,83 +579,85 @@ mod tests {
         };
 
         static MOD_HOLD_DEPRESS_TRANS: Transition<1, 1, 1> = Transition {
-            conditions: [TransitionCondition::Depressed(0)],
+            conditions: [TransitionCondition::depressed_single(0)],
             key_event_emissions: [KeyEvent::Depress(2)],
             internal_event_emissions: [InternalEvent::UnsetGlobalState(StateFlags::SHFT)],
             target: ROOT.as_dyn(),
         };
 
         static MOD_HOLD_OTHER_TRANS: Transition<1, 2, 0> = Transition {
-            conditions: [TransitionCondition::Pressed(1)],
+            conditions: [TransitionCondition::pressed_single(1)],
             key_event_emissions: [KeyEvent::Press(1), KeyEvent::Depress(1)],
             internal_event_emissions: [],
             target: MOD_HOLD.as_dyn(),
         };
 
+        let mut clock = TickerClock(0);
+
         let mut state = GlobalState {
             flags: StateFlags::empty(),
-            entered_state: now(),
+            entered_state: clock.now(),
             current_state: ROOT.as_dyn(),
         };
 
         for _ in 0..10 {
-            let s = state.push(now(), crate::InputEvent::Press(0));
+            let s = state.push(clock.now(), crate::InputEvent::Press(0));
             assert_eq!(state.current_state, MOD.as_dyn());
             assert_matches!(s, []);
 
-            tick();
+            clock.tick();
 
-            let s = state.push(now(), crate::InputEvent::Depress(0));
+            let s = state.push(clock.now(), crate::InputEvent::Depress(0));
             assert_eq!(state.current_state, ROOT.as_dyn());
             assert_matches!(s, [KeyEvent::Press(0), KeyEvent::Depress(0)]);
 
-            let s = state.push(now(), crate::InputEvent::Press(0));
+            let s = state.push(clock.now(), crate::InputEvent::Press(0));
             assert_eq!(state.current_state, MOD.as_dyn());
             assert_matches!(s, []);
 
-            tick_n(8);
+            clock.tick_n(8);
 
-            let s = state.tick(now());
+            let s = state.tick(clock.now());
             assert_eq!(state.current_state, MOD_HOLD.as_dyn());
             assert_matches!(s, [KeyEvent::Press(2)]);
 
-            tick();
+            clock.tick();
 
-            let s = state.push(now(), crate::InputEvent::Press(1));
+            let s = state.push(clock.now(), crate::InputEvent::Press(1));
             assert_eq!(state.current_state, MOD_HOLD.as_dyn());
             assert_matches!(s, [KeyEvent::Press(1), KeyEvent::Depress(1)]);
 
-            tick();
+            clock.tick();
 
-            let s = state.push(now(), crate::InputEvent::Depress(0));
+            let s = state.push(clock.now(), crate::InputEvent::Depress(0));
             assert_eq!(state.current_state, ROOT.as_dyn());
             assert_matches!(s, [KeyEvent::Depress(2)]);
             assert_eq!(state.flags, StateFlags::empty());
 
-            tick();
+            clock.tick();
 
-            let s = state.push(now(), crate::InputEvent::Press(0));
+            let s = state.push(clock.now(), crate::InputEvent::Press(0));
             assert_eq!(state.current_state, MOD.as_dyn());
             assert_matches!(s, []);
 
-            tick();
+            clock.tick();
 
-            let s = state.push(now(), crate::InputEvent::Press(1));
+            let s = state.push(clock.now(), crate::InputEvent::Press(1));
             assert_eq!(state.current_state, MOD_HOLD.as_dyn());
             assert_matches!(
                 s,
                 [KeyEvent::Press(2), KeyEvent::Press(1), KeyEvent::Depress(1)]
             );
 
-            tick();
+            clock.tick();
 
-            let s = state.push(now(), crate::InputEvent::Press(1));
+            let s = state.push(clock.now(), crate::InputEvent::Press(1));
             assert_eq!(state.current_state, MOD_HOLD.as_dyn());
             assert_matches!(s, [KeyEvent::Press(1), KeyEvent::Depress(1)]);
 
-            tick();
+            clock.tick();
 
-            let s = state.push(now(), crate::InputEvent::Depress(0));
+            let s = state.push(clock.now(), crate::InputEvent::Depress(0));
             assert_eq!(state.current_state, ROOT.as_dyn());
             assert_matches!(s, [KeyEvent::Depress(2)]);
             assert_eq!(state.flags, StateFlags::empty());
